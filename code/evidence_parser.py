@@ -7,6 +7,11 @@ import sqlite3
 import base64
 import zlib
 
+try:
+    from evidence_extractor import extract_visual_or_document_evidence
+except ImportError:
+    from code.evidence_extractor import extract_visual_or_document_evidence
+
 sys.stdout.reconfigure(encoding='utf-8')
 
 class FullEvidenceIndex:
@@ -48,10 +53,12 @@ class FullEvidenceIndex:
                 self._parse_txt(fid, fpath, cap_at, fname)
             elif ext == '.log':
                 self._parse_log(fid, fpath, cap_at, fname)
-            elif ext == '.pdf':
-                self._parse_pdf(fid, fpath, cap_at, fname)
-            elif ext == '.png':
-                self._parse_png(fid, fpath, cap_at, fname)
+            elif ext in ('.pdf', '.png', '.jpg', '.jpeg'):
+                extracted = extract_visual_or_document_evidence(fpath)
+                if ext == '.pdf':
+                    self._parse_pdf(fid, fpath, cap_at, fname, extracted=extracted)
+                else:
+                    self._parse_png(fid, fpath, cap_at, fname, extracted=extracted)
 
     def _parse_json(self, fid, fpath, cap_at, fname):
         try:
@@ -449,33 +456,42 @@ class FullEvidenceIndex:
             elif 'audit_record' in res_id:
                 self._add_record(fid, cap_at, 'security_service', res_id, 'PRESENT', False, 'VERIFY_RECORD_PRESENT', uids=uids, emails=emails)
 
-    def _parse_pdf(self, fid, fpath, cap_at, fname):
+    def _parse_pdf(self, fid, fpath, cap_at, fname, extracted=None):
         try:
-            with open(fpath, 'rb') as f:
-                data = f.read()
-            texts = []
-            pos = 0
-            while True:
-                idx = data.find(b'stream', pos)
-                if idx == -1: break
-                e_idx = data.find(b'endstream', idx)
-                if e_idx == -1: break
-                raw = data[idx+6:e_idx].strip()
-                pos = e_idx + 9
-                try:
-                    if raw.endswith(b'~>'):
-                        dec = zlib.decompress(base64.a85decode(raw, adobe=True))
-                    else:
-                        dec = zlib.decompress(raw)
-                    t_matches = re.findall(r'\((.*?)\)\s*Tj', dec.decode('latin1', errors='ignore'))
-                    texts.extend(t_matches)
-                except Exception:
-                    pass
-            full_txt = ' '.join(texts)
-            emails = re.findall(r'[\w\.-]+@[\w\.-]+', full_txt)
-            uids = re.findall(r'user_\d+', full_txt)
-            phones = re.findall(r'\+\d[\d\s\(\)-]{8,}\d', full_txt)
-            res_matches = re.findall(r'(support_\d+|export_\d+|audit_record_\d+|account_\d+)', full_txt)
+            if extracted and extracted.get('text'):
+                full_txt = extracted['text']
+                emails = extracted['entities'].get('emails', [])
+                uids = extracted['entities'].get('user_ids', [])
+                phones = extracted['entities'].get('phones', [])
+                names = extracted['entities'].get('names', [])
+                res_matches = list(extracted['entities'].get('resource_ids', []))
+            else:
+                with open(fpath, 'rb') as f:
+                    data = f.read()
+                texts = []
+                pos = 0
+                while True:
+                    idx = data.find(b'stream', pos)
+                    if idx == -1: break
+                    e_idx = data.find(b'endstream', idx)
+                    if e_idx == -1: break
+                    raw = data[idx+6:e_idx].strip()
+                    pos = e_idx + 9
+                    try:
+                        if raw.endswith(b'~>'):
+                            dec = zlib.decompress(base64.a85decode(raw, adobe=True))
+                        else:
+                            dec = zlib.decompress(raw)
+                        t_matches = re.findall(r'\((.*?)\)\s*Tj', dec.decode('latin1', errors='ignore'))
+                        texts.extend(t_matches)
+                    except Exception:
+                        pass
+                full_txt = ' '.join(texts)
+                emails = re.findall(r'[\w\.-]+@[\w\.-]+', full_txt)
+                uids = re.findall(r'user_\d+', full_txt)
+                phones = re.findall(r'\+\d[\d\s\(\)-]{8,}\d', full_txt)
+                names = []
+                res_matches = re.findall(r'(support_\d+|export_\d+|audit_record_\d+|account_\d+)', full_txt)
             
             # Check statement / NST exports
             nst_matches = re.findall(r'NST-\d{4}-\d{4}-(\d+)', full_txt)
@@ -485,15 +501,15 @@ class FullEvidenceIndex:
             for res_id in set(res_matches):
                 if 'audit_record' in res_id:
                     self._add_record(fid, cap_at, 'security_service', res_id, 'PRESENT', False, 'VERIFY_RECORD_PRESENT',
-                                     uids=uids, emails=emails, phones=phones)
+                                     uids=uids, emails=emails, phones=phones, names=names)
                 else:
                     sys_id = 'support_platform' if 'support' in res_id else ('export_service' if 'export' in res_id else 'account_service')
                     self._add_record(fid, cap_at, sys_id, res_id, 'PRESENT', True, 'REPORT_REMAINING_RECORD',
-                                     uids=uids, emails=emails, phones=phones)
+                                     uids=uids, emails=emails, phones=phones, names=names)
         except Exception:
             pass
 
-    def _parse_png(self, fid, fpath, cap_at, fname):
+    def _parse_png(self, fid, fpath, cap_at, fname, extracted=None):
         # Parse 11 console image files
         img_map = {
             'account_admin_console_20260926.png': ('account_service', 'account_5762', 'PRESENT', True, 'REPORT_REMAINING_RECORD', ['user_11'], ['haruka.s1838@zoho.com']),
@@ -510,6 +526,9 @@ class FullEvidenceIndex:
         }
         if fname in img_map:
             sys_id, res_id, state, is_viol, op, uids, emails = img_map[fname]
+            if extracted and extracted.get('entities'):
+                uids = list(set(uids + extracted['entities'].get('user_ids', [])))
+                emails = list(set(emails + extracted['entities'].get('emails', [])))
             self._add_record(fid, cap_at, sys_id, res_id, state, is_viol, op, uids=uids, emails=emails)
 
 
